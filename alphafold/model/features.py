@@ -44,9 +44,10 @@ def make_data_config(
 
 
 def tf_example_to_features(tf_example: tf.train.Example,
-                           config: ml_collections.ConfigDict,
+                           config: ml_collections.ConfigDict, 
                            random_seed: int = 0) -> FeatureDict:
   """Converts tf_example to numpy feature dictionary."""
+
   num_res = int(tf_example.features.feature['seq_length'].int64_list.value[0])
   cfg, feature_names = make_data_config(config, num_res=num_res)
 
@@ -76,8 +77,8 @@ def tf_example_to_features(tf_example: tf.train.Example,
 
 
 def np_example_to_features(np_example: FeatureDict,
-                           config: ml_collections.ConfigDict,
-                           random_seed: int = 0) -> FeatureDict:
+                           config: ml_collections.ConfigDict, 
+                           random_seed: int = 0,) -> FeatureDict:
   """Preprocesses NumPy feature dict using TF pipeline."""
   np_example = dict(np_example)
   num_res = int(np_example['seq_length'][0])
@@ -100,5 +101,4 @@ def np_example_to_features(np_example: FeatureDict,
 
   with tf.Session(graph=tf_graph) as sess:
     features = sess.run(processed_batch)
-
   return {k: v for k, v in features.items() if v.dtype != 'O'}

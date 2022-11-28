@@ -26,15 +26,17 @@ import ml_collections
 import numpy as np
 import tensorflow.compat.v1 as tf
 import tree
-
+import jax.profiler
+import math
+import jax.numpy as jnp
 
 def get_confidence_metrics(
     prediction_result: Mapping[str, Any],
-    multimer_mode: bool) -> Mapping[str, Any]:
+    multimer_mode: bool, num_res ,recompile_padding: float=1.1) -> Mapping[str, Any]:
   """Post processes prediction_result to get confidence metrics."""
   confidence_metrics = {}
   confidence_metrics['plddt'] = confidence.compute_plddt(
-      prediction_result['predicted_lddt']['logits'])
+      prediction_result['predicted_lddt']['logits'], num_res=num_res,recompile_padding=recompile_padding)
   if 'predicted_aligned_error' in prediction_result:
     confidence_metrics.update(confidence.compute_predicted_aligned_error(
         logits=prediction_result['predicted_aligned_error']['logits'],
@@ -42,14 +44,14 @@ def get_confidence_metrics(
     confidence_metrics['ptm'] = confidence.predicted_tm_score(
         logits=prediction_result['predicted_aligned_error']['logits'],
         breaks=prediction_result['predicted_aligned_error']['breaks'],
-        asym_id=None)
+        asym_id=None, recompile_padding=recompile_padding, num_res=num_res)
     if multimer_mode:
       # Compute the ipTM only for the multimer model.
       confidence_metrics['iptm'] = confidence.predicted_tm_score(
           logits=prediction_result['predicted_aligned_error']['logits'],
           breaks=prediction_result['predicted_aligned_error']['breaks'],
           asym_id=prediction_result['predicted_aligned_error']['asym_id'],
-          interface=True)
+          interface=True,recompile_padding=recompile_padding, num_res=num_res)
       confidence_metrics['ranking_confidence'] = (
           0.8 * confidence_metrics['iptm'] + 0.2 * confidence_metrics['ptm'])
 
@@ -123,10 +125,8 @@ class RunModel:
     Returns:
       A dict of NumPy feature arrays suitable for feeding into the model.
     """
-
     if self.multimer_mode:
       return raw_features
-
     # Single-chain mode.
     if isinstance(raw_features, dict):
       return features.np_example_to_features(
@@ -150,6 +150,8 @@ class RunModel:
   def predict(self,
               feat: features.FeatureDict,
               random_seed: int = 0,
+              recompile_padding: float=1.0,
+              seq_len:int=0
               ) -> Mapping[str, Any]:
     """Makes a prediction by inferencing the model on the provided features.
 
@@ -165,7 +167,7 @@ class RunModel:
     self.init_params(feat)
     logging.info('Running predict with shape(feat) = %s',
                  tree.map_structure(lambda x: x.shape, feat))
-    
+
     aatype = feat["aatype"]
     if self.multimer_mode:
       num_iters = self.config.model.num_recycle + 1
@@ -174,33 +176,39 @@ class RunModel:
       num_iters = self.config.model.num_recycle + 1
       num_ensemble = self.config.data.eval.num_ensemble
       L = aatype.shape[1]
-    
+
     result = {"prev":{'prev_msa_first_row': np.zeros([L,256]),
                       'prev_pair': np.zeros([L,L,128]),
                       'prev_pos': np.zeros([L,37,3])}}
-        
     r = 0
     key = jax.random.PRNGKey(random_seed)
+    
     while r < num_iters:
         if self.multimer_mode:
             sub_feat = feat
             sub_feat["iter"] = np.array(r)
+            num_res=feat['seq_length']
         else:
             s = r * num_ensemble
             e = (r+1) * num_ensemble
             sub_feat = jax.tree_map(lambda x:x[s:e], feat)
-            
+            num_res=feat['seq_length'][0]
+
         sub_feat["prev"] = result["prev"]
+
         result, _ = self.apply(self.params, key, sub_feat)
-        confidences = get_confidence_metrics(result, multimer_mode=self.multimer_mode)
+        
+        # print('**')
+        confidences = get_confidence_metrics(result, multimer_mode=self.multimer_mode,num_res=num_res,recompile_padding=recompile_padding)
+        
         if self.config.model.stop_at_score_ranker == "plddt":
-          mean_score = (confidences["plddt"] * feat["seq_mask"]).sum() / feat["seq_mask"].sum()
+          mean_score = (confidences["plddt"] * feat["seq_mask"][:,:num_res]).sum() / feat["seq_mask"].sum()
         else:
           mean_score = confidences["ptm"].mean()
+          #print(mean_score)
         result.update(confidences)
         r += 1
         if mean_score > self.config.model.stop_at_score:
             break
-
     logging.info('Output shape was %s', tree.map_structure(lambda x: x.shape, result))
     return result, (r-1)

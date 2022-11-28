@@ -30,7 +30,7 @@ from alphafold.model import utils
 import haiku as hk
 import jax
 import jax.numpy as jnp
-
+import math
 
 def softmax_cross_entropy(logits, labels):
   """Computes softmax cross entropy given logits and one-hot class labels."""
@@ -242,6 +242,7 @@ class AlphaFoldIteration(hk.Module):
           representations.update(ret[name].pop('representations'))
       if compute_loss:
         total_loss += loss(module, head_config, ret, name)
+        
 
     if self.config.heads.get('predicted_lddt.weight', 0.0):
       # Add PredictedLDDTHead after StructureModule executes.
@@ -251,7 +252,7 @@ class AlphaFoldIteration(hk.Module):
       ret[name] = module(representations, batch, is_training)
       if compute_loss:
         total_loss += loss(module, head_config, ret, name, filter_ret=False)
-
+        
     if ('predicted_aligned_error' in self.config.heads
         and self.config.heads.get('predicted_aligned_error.weight', 0.0)):
       # Add PredictedAlignedErrorHead after StructureModule executes.
@@ -261,7 +262,7 @@ class AlphaFoldIteration(hk.Module):
       ret[name] = module(representations, batch, is_training)
       if compute_loss:
         total_loss += loss(module, head_config, ret, name, filter_ret=False)
-
+        
     if compute_loss:
       return ret, total_loss
     else:
@@ -522,6 +523,8 @@ class Attention(hk.Module):
     Returns:
       A float32 tensor of shape [batch_size, N_queries, output_dim].
     """
+
+
     # Sensible default for when the config keys are missing
     key_dim = self.config.get('key_dim', int(q_data.shape[-1]))
     value_dim = self.config.get('value_dim', int(m_data.shape[-1]))
@@ -582,6 +585,169 @@ class Attention(hk.Module):
 
     return output
 
+
+
+# class Attention(hk.Module):
+#     """Multihead attention."""
+
+#     def __init__(self, config, global_config, output_dim, name='attention'):
+#         super().__init__(name=name)
+
+#         self.config = config
+#         self.global_config = global_config
+#         self.output_dim = output_dim
+
+#     def _query_chunk_attention(self, query, key, value, bias, precision, key_chunk_size=512):
+#         """Multi-head dot product attention with a limited number of queries."""
+#         num_kv, num_heads, k_features = key.shape
+#         num_q, num_heads, q_features = query.shape
+#         v_features = value.shape[-1]
+#         key_chunk_size = min(key_chunk_size, num_kv)
+
+#         @functools.partial(jax.checkpoint, prevent_cse=False)
+#         def summarize_chunk(query, key, value, bias):
+#             attn_weights = jnp.einsum('qhd,khd->qhk', query, key, precision=precision) + jnp.swapaxes(bias, 0, 2)
+#             max_score = jnp.max(attn_weights, axis=-1, keepdims=True)
+#             max_score = jax.lax.stop_gradient(max_score)
+#             exp_weights = jnp.exp(attn_weights - max_score)
+#             exp_values = jnp.einsum('vhf,qhv->qhf', value, exp_weights, precision=precision)
+#             return (exp_values, exp_weights.sum(axis=-1), max_score.reshape((query.shape[0], num_heads)))
+
+#         def chunk_scanner(chunk_idx):
+#             key_chunk = jax.lax.dynamic_slice(key, (chunk_idx, 0, 0),
+#                                               slice_sizes=(key_chunk_size, num_heads, k_features))
+#             value_chunk = jax.lax.dynamic_slice(value, (chunk_idx, 0, 0),
+#                                                 slice_sizes=(key_chunk_size, num_heads, v_features))
+#             if bias.shape[0] == 1:
+#                 bias_chunk = jax.lax.dynamic_slice(jnp.swapaxes(bias, 0, 2), (chunk_idx, 0, 0),
+#                                                    slice_sizes=(key_chunk_size, num_heads, 1))
+#             elif bias is None:
+#                 bias_chunk=None
+#             else:
+#                 bias_chunk = jax.lax.dynamic_slice(jnp.swapaxes(bias, 0, 2), (chunk_idx, 0, 0),
+#                                                    slice_sizes=(key_chunk_size, num_heads, num_q))
+#             return summarize_chunk(query, key_chunk, value_chunk, bias_chunk)
+
+#         chunk_values, chunk_weights, chunk_max = jax.lax.map(chunk_scanner, xs=jnp.arange(0, num_kv, key_chunk_size))
+#         global_max = jnp.max(chunk_max, axis=0, keepdims=True)
+#         max_diffs = jnp.exp(chunk_max - global_max)
+#         chunk_values *= jnp.expand_dims(max_diffs, axis=-1)
+#         chunk_weights *= max_diffs
+
+#         all_values = chunk_values.sum(axis=0)
+#         all_weights = jnp.expand_dims(chunk_weights, -1).sum(axis=0)
+#         return all_values / all_weights
+
+#     def attention(self, query, key, value, bias, precision=jax.lax.Precision.HIGHEST,
+#                   query_chunk_size=512):
+#         num_q, num_heads, q_features = query.shape
+#         num_kv, _, _ = value.shape
+#         def chunk_scanner(chunk_idx, _):
+#             query_chunk = jax.lax.dynamic_slice(query, (chunk_idx, 0, 0),
+#                                                 slice_sizes=(min(query_chunk_size, num_q), num_heads, q_features))
+#             if bias.shape[0] == 1:
+#                 bias_chunk = jax.lax.dynamic_slice(bias, (chunk_idx, 0, 0),
+#                                                   slice_sizes=(min(1, query_chunk_size, num_q), num_heads, num_kv))
+#             else:
+#                 bias_chunk = jax.lax.dynamic_slice(bias, (chunk_idx, 0, 0),
+#                                                    slice_sizes=(min(query_chunk_size, num_q), num_heads, num_kv))
+#             return (chunk_idx + query_chunk_size,
+#                     self._query_chunk_attention(query_chunk, key, value, bias_chunk, precision=precision))
+
+
+
+
+#         _, res = hk.scan(chunk_scanner, init=0, xs=None,
+#                          length=math.ceil(num_q / query_chunk_size))# length=math.ceil(num_q / query_chunk_size)
+
+#         # rest=num_q % query_chunk_size
+
+#         # if rest!=0:
+#         #     _, rem = chunk_scanner2(num_q-rest,_)
+#         #     res=res.reshape(-1,num_heads, value.shape[-1])
+#         #
+#         #     res=jnp.concatenate([res,rem],axis=0)
+#         # return res.reshape(-1, num_heads, value.shape[-1])
+
+#         return res.reshape(-1, num_heads, value.shape[-1])[:num_q]
+
+#     def __call__(self, q_data, m_data, bias, nonbatched_bias=None):
+#         """Builds Attention module.
+#         Arguments:
+#           q_data: A tensor of queries, shape [batch_size, N_queries, q_channels].
+#           m_data: A tensor of memories from which the keys and values are
+#             projected, shape [batch_size, N_keys, m_channels].
+#           bias: A bias for the attention, shape [batch_size, num_heads, N_queries, N_keys].
+#           nonbatched_bias: Shared bias, shape [num_heads, N_queries, N_keys].
+#         Returns:
+#           A float32 tensor of shape [batch_size, N_queries, output_dim].
+#         """
+#         # Sensible default for when the config keys are missing
+
+#         key_dim = self.config.get('key_dim', int(q_data.shape[-1]))
+#         value_dim = self.config.get('value_dim', int(m_data.shape[-1]))
+#         num_head = self.config.num_head
+
+#         assert key_dim % num_head == 0
+#         assert value_dim % num_head == 0
+#         key_dim = key_dim // num_head
+#         value_dim = value_dim // num_head
+
+#         q_weights = hk.get_parameter(
+#             'query_w', shape=(q_data.shape[-1], num_head, key_dim),
+#             init=glorot_uniform())
+#         k_weights = hk.get_parameter(
+#             'key_w', shape=(m_data.shape[-1], num_head, key_dim),
+#             init=glorot_uniform())
+#         v_weights = hk.get_parameter(
+#             'value_w', shape=(m_data.shape[-1], num_head, value_dim),
+#             init=glorot_uniform())
+
+#         q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights) * key_dim ** (-0.5)
+#         k = jnp.einsum('bka,ahc->bkhc', m_data, k_weights)
+#         v = jnp.einsum('bka,ahc->bkhc', m_data, v_weights)
+#         ###no logits. qk+bias
+
+#         if nonbatched_bias is not None:
+#             bias += jnp.expand_dims(nonbatched_bias, axis=0)  #####bias???
+#         num_head_bias = bias.shape[1]
+#         num_head_bias_bool = int(num_head_bias == num_head)
+#         num_head_bias_repeat = num_head * (1 - num_head_bias_bool) + num_head_bias_bool
+#         bias = jnp.repeat(jnp.swapaxes(bias, 1, 2), num_head_bias_repeat, 2)  # bhqk -> bqhk
+
+#         # if bias.shape[0]==1:
+#         #     bias=jnp.repeat(bias,q.shape[0], axis=0)
+
+
+#         weighted_avg = jax.vmap(self.attention)(q, k, v, bias)
+
+#         if self.global_config.zero_init:
+#             init = hk.initializers.Constant(0.0)
+#         else:
+#             init = glorot_uniform()
+#         if self.config.gating:
+#             gating_weights = hk.get_parameter(
+#                 'gating_w',
+#                 shape=(q_data.shape[-1], num_head, value_dim),
+#                 init=hk.initializers.Constant(0.0))
+#             gating_bias = hk.get_parameter(
+#                 'gating_b',
+#                 shape=(num_head, value_dim),
+#                 init=hk.initializers.Constant(1.0))
+#             gate_values = jnp.einsum('bqc, chv->bqhv', q_data,
+#                                      gating_weights) + gating_bias
+#             gate_values = jax.nn.sigmoid(gate_values)
+#             weighted_avg *= gate_values
+
+#         o_weights = hk.get_parameter(
+#             'output_w', shape=(num_head, value_dim, self.output_dim),
+#             init=init)
+#         o_bias = hk.get_parameter('output_b', shape=(self.output_dim,),
+#                                   init=hk.initializers.Constant(0.0))
+#         output = jnp.einsum('bqhc,hco->bqo', weighted_avg, o_weights) + o_bias
+
+
+#         return output
 
 class GlobalAttention(hk.Module):
   """Global attention.
@@ -671,6 +837,145 @@ class GlobalAttention(hk.Module):
       output = output[:, None]
     return output
 
+# class GlobalAttention(hk.Module):
+#     def __init__(self, config, global_config, output_dim, name='attention'):
+#         super().__init__(name=name)
+
+#         self.config = config
+#         self.global_config = global_config
+#         self.output_dim = output_dim
+
+#     def _query_chunk_attention(self, query, key, value, bias, precision, key_chunk_size=1024):
+#         """Multi-head dot product attention with a limited number of queries."""
+#         num_heads, k_features = key.shape  ##'b h c' except q : num_kv,
+#         num_q, q_features = query.shape  # 'b k h c' to 'b k c' except h num_heads,
+#         v_features = value.shape[-1]
+#         key_chunk_size = min(key_chunk_size, k_features)
+
+#         @functools.partial(jax.checkpoint, prevent_cse=False)
+#         def summarize_chunk(query, key, value, bias):
+
+#             attn_weights = jnp.einsum('hc,kc->hk', query, key, precision=precision) + jnp.swapaxes(bias, 0, 1)
+#             max_score = jnp.max(attn_weights, axis=-1, keepdims=True)
+#             max_score = jax.lax.stop_gradient(max_score)
+#             exp_weights = jnp.exp(attn_weights - max_score)
+#             exp_values = jnp.einsum('hk,kc->hc', value, exp_weights, precision=precision)
+#             # print(max_score.shape)  #8,1
+#             # a=max_score.reshape((query.shape[0], num_heads)) ##5120, 8
+#             return (exp_values, exp_weights.sum(axis=-1), max_score.reshape((query.shape[0])))
+
+#         def chunk_scanner(chunk_idx):
+#             key_chunk = jax.lax.dynamic_slice(key, (chunk_idx, 0),
+#                                               slice_sizes=(key_chunk_size, k_features))
+#             value_chunk = jax.lax.dynamic_slice(value, (chunk_idx, 0),
+#                                                 slice_sizes=(key_chunk_size, v_features))
+#             if bias.shape[0] == 1:
+#                 bias_chunk = jax.lax.dynamic_slice(jnp.swapaxes(bias, 0, 1), (chunk_idx, 0),
+#                                                    slice_sizes=(
+#                                                    key_chunk_size, 1))  # jnp.swapaxes(bias, 0, 2) num_heads,
+#             elif bias is None:
+#                 bias_chunk = None
+#             else:
+#                 bias_chunk = jax.lax.dynamic_slice(jnp.swapaxes(bias, 0, 1), (chunk_idx, 0),
+#                                                    slice_sizes=(key_chunk_size, num_q))  # jnp.swapaxes(bias, 0, 2)
+#             return summarize_chunk(query, key_chunk, value_chunk, bias_chunk)
+
+#         chunk_values, chunk_weights, chunk_max = jax.lax.map(chunk_scanner,
+#                                                              xs=jnp.arange(0, k_features, key_chunk_size))  ##num_kv
+#         global_max = jnp.max(chunk_max, axis=0, keepdims=True)
+#         max_diffs = jnp.exp(chunk_max - global_max)
+#         chunk_values *= jnp.expand_dims(max_diffs, axis=-1)
+#         chunk_weights *= max_diffs
+
+#         all_values = chunk_values.sum(axis=0)
+#         all_weights = jnp.expand_dims(chunk_weights, -1).sum(axis=0)
+#         return all_values / all_weights
+
+#     def attention(self, query, key, value, bias, precision=jax.lax.Precision.HIGHEST,
+#                   query_chunk_size=1024):
+
+#         num_q, q_features = query.shape  # 'b k h c' to 'b k c' except h num_heads,
+#         #  num_q, num_heads, q_features = query.shape
+#         num_kv, _ = value.shape
+
+#         def chunk_scanner(chunk_idx, _):
+#             query_chunk = jax.lax.dynamic_slice(query, (chunk_idx, 0),
+#                                                 slice_sizes=(min(query_chunk_size, num_q), q_features))
+#             if bias.shape[0] == 1:
+#                 bias_chunk = jax.lax.dynamic_slice(bias, (chunk_idx, 0),
+#                                                    slice_sizes=(min(1, query_chunk_size, num_q), num_kv))
+#             else:
+#                 bias_chunk = jax.lax.dynamic_slice(bias, (chunk_idx, 0),
+#                                                    slice_sizes=(min(query_chunk_size, num_q), num_kv))
+#             return (chunk_idx + query_chunk_size,
+#                     self._query_chunk_attention(query_chunk, key, value, bias_chunk, precision=precision))
+
+#         _, res = hk.scan(chunk_scanner, init=0, xs=None,
+#                          length=math.ceil(num_q / query_chunk_size))  # length=math.ceil(num_q / query_chunk_size)
+
+#         return res.reshape(-1, value.shape[-1])[:num_q]
+
+#     def __call__(self, q_data, m_data, q_mask):
+#         key_dim = self.config.get('key_dim', int(q_data.shape[-1]))
+#         value_dim = self.config.get('value_dim', int(m_data.shape[-1]))
+#         num_head = self.config.num_head
+
+#         assert key_dim % num_head == 0
+#         assert value_dim % num_head == 0
+#         key_dim = key_dim // num_head
+#         value_dim = value_dim // num_head
+
+#         q_weights = hk.get_parameter(
+#             'query_w', shape=(q_data.shape[-1], num_head, key_dim),
+#             init=glorot_uniform())
+#         k_weights = hk.get_parameter(
+#             'key_w', shape=(m_data.shape[-1], key_dim),
+#             init=glorot_uniform())
+#         v_weights = hk.get_parameter(
+#             'value_w', shape=(m_data.shape[-1], value_dim),
+#             init=glorot_uniform())
+
+#         v = jnp.einsum('bka,ac->bkc', m_data, v_weights)
+
+#         q_avg = utils.mask_mean(q_mask, q_data, axis=1)
+
+#         q = jnp.einsum('ba,ahc->bhc', q_avg, q_weights) * key_dim ** (-0.5)
+#         k = jnp.einsum('bka,ac->bkc', m_data, k_weights)
+#         bias = (1e9 * (q_mask[:, None, :, 0] - 1.))
+
+#         num_head_bias = bias.shape[1]
+#         num_head_bias_bool = int(num_head_bias == num_head)
+#         num_head_bias_repeat = num_head * (1 - num_head_bias_bool) + num_head_bias_bool
+
+#         #bias = jnp.repeat(jnp.swapaxes(bias, 1, 2), num_head_bias_repeat, 2)  # bhqk -> bqhk
+#         weighted_avg = jax.vmap(self.attention)(q, k, v, bias)
+
+#         if self.global_config.zero_init:
+#             init = hk.initializers.Constant(0.0)
+#         else:
+#             init = glorot_uniform()
+#         o_weights = hk.get_parameter(
+#             'output_w', shape=(num_head, value_dim, self.output_dim),
+#             init=init)
+#         o_bias = hk.get_parameter('output_b', shape=(self.output_dim,),
+#                                   init=hk.initializers.Constant(0.0))
+#         if self.config.gating:
+#             gating_weights = hk.get_parameter(
+#                 'gating_w',
+#                 shape=(q_data.shape[-1], num_head, value_dim),
+#                 init=hk.initializers.Constant(0.0))
+#             gating_bias = hk.get_parameter(
+#                 'gating_b',
+#                 shape=(num_head, value_dim),
+#                 init=hk.initializers.Constant(1.0))
+#             gate_values = jnp.einsum('bqc, chv->bqhv', q_data, gating_weights)
+#             gate_values = jax.nn.sigmoid(gate_values + gating_bias)
+#             weighted_avg = weighted_avg[:, None] * gate_values
+#             output = jnp.einsum('bqhc,hco->bqo', weighted_avg, o_weights) + o_bias
+#         else:
+#             output = jnp.einsum('bhc,hco->bo', weighted_avg, o_weights) + o_bias
+#             output = output[:, None]
+#         return output
 
 class MSARowAttentionWithPairBias(hk.Module):
   """MSA per-row attention biased by the pair representation.
@@ -1674,16 +1979,19 @@ class EmbeddingsAndEvoformer(hk.Module):
     preprocess_1d = common_modules.Linear(
         c.msa_channel, name='preprocess_1d')(
             batch['target_feat'])
-
+ 
     preprocess_msa = common_modules.Linear(
         c.msa_channel, name='preprocess_msa')(
             batch['msa_feat'])
 
     msa_activations = jnp.expand_dims(preprocess_1d, axis=0) + preprocess_msa
-
+    
     left_single = common_modules.Linear(
         c.pair_channel, name='left_single')(
             batch['target_feat'])
+    #jax.debug.print("{}", batch['target_feat'])
+    # print(batch['target_feat'].shape) #204,22
+    # print(left_single.shape)  #204,128
     right_single = common_modules.Linear(
         c.pair_channel, name='right_single')(
             batch['target_feat'])
@@ -1700,7 +2008,7 @@ class EmbeddingsAndEvoformer(hk.Module):
       pair_activations += common_modules.Linear(
           c.pair_channel, name='prev_pos_linear')(
               dgram)
-
+    
     if c.recycle_features:
       prev_msa_first_row = hk.LayerNorm(
           axis=[-1],
@@ -1869,11 +2177,12 @@ class EmbeddingsAndEvoformer(hk.Module):
 
     msa_activations = evoformer_output['msa']
     pair_activations = evoformer_output['pair']
-
+    #jax.debug.print("{}", pair_activations)
+    
     single_activations = common_modules.Linear(
         c.seq_channel, name='single_activations')(
             msa_activations[0])
-
+    #jax.debug.print("{}", single_activations)
     num_sequences = batch['msa_feat'].shape[0]
     output = {
         'single': single_activations,

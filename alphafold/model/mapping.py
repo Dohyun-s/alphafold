@@ -23,7 +23,6 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 
-
 PYTREE = Any
 PYTREE_JAX_ARRAY = Any
 
