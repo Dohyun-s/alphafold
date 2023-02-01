@@ -31,11 +31,15 @@ import tree
 
 def get_confidence_metrics(
     prediction_result: Mapping[str, Any],
-    multimer_mode: bool) -> Mapping[str, Any]:
+    multimer_mode: bool, 
+    num_res: int,
+    recompile_padding: float = 1.0) -> Mapping[str, Any]:
   """Post processes prediction_result to get confidence metrics."""
   confidence_metrics = {}
   confidence_metrics['plddt'] = confidence.compute_plddt(
-      prediction_result['predicted_lddt']['logits'])
+      prediction_result['predicted_lddt']['logits'],
+      num_res=num_res,
+      recompile_padding=recompile_padding)
   if 'predicted_aligned_error' in prediction_result:
     confidence_metrics.update(confidence.compute_predicted_aligned_error(
         logits=prediction_result['predicted_aligned_error']['logits'],
@@ -43,14 +47,18 @@ def get_confidence_metrics(
     confidence_metrics['ptm'] = confidence.predicted_tm_score(
         logits=prediction_result['predicted_aligned_error']['logits'],
         breaks=prediction_result['predicted_aligned_error']['breaks'],
-        asym_id=None)
+        num_res=num_res,
+        asym_id=None,
+        recompile_padding=recompile_padding)
     if multimer_mode:
       # Compute the ipTM only for the multimer model.
       confidence_metrics['iptm'] = confidence.predicted_tm_score(
           logits=prediction_result['predicted_aligned_error']['logits'],
           breaks=prediction_result['predicted_aligned_error']['breaks'],
+          num_res=num_res,
           asym_id=prediction_result['predicted_aligned_error']['asym_id'],
-          interface=True)
+          interface=True,
+          recompile_padding=recompile_padding)
       confidence_metrics['ranking_confidence'] = (
           0.8 * confidence_metrics['iptm'] + 0.2 * confidence_metrics['ptm'])
 
@@ -151,6 +159,8 @@ class RunModel:
   def predict(self,
               feat: features.FeatureDict,
               random_seed: int = 0,
+              recompile_padding: float = 1.0,
+              seq_len: int = 0
               ) -> Mapping[str, Any]:
     """Makes a prediction by inferencing the model on the provided features.
 
@@ -186,17 +196,19 @@ class RunModel:
         if self.multimer_mode:
             sub_feat = feat
             sub_feat["iter"] = np.array(r)
+            num_res = feat['seq_length']
         else:
             s = r * num_ensemble
             e = (r+1) * num_ensemble
             sub_feat = jax.tree_map(lambda x:x[s:e], feat)
-            
+            num_res = feat['seq_length'][0]
+
         sub_feat["prev"] = result["prev"]
         result, _ = self.apply(self.params, key, sub_feat)
-        confidences = get_confidence_metrics(result, multimer_mode=self.multimer_mode)
+        confidences = get_confidence_metrics(result, multimer_mode=self.multimer_mode, num_res=num_res, recompile_padding=recompile_padding)
 
         if self.config.model.stop_at_score_ranker == "plddt":
-          mean_score = (confidences["plddt"] * feat["seq_mask"]).sum() / feat["seq_mask"].sum()
+          mean_score = (confidences["plddt"] * feat["seq_mask"][:,:num_res]).sum() / feat["seq_mask"].sum()
         else:
           mean_score = confidences["ptm"].mean()
         

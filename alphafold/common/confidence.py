@@ -17,9 +17,9 @@
 from typing import Dict, Optional, Tuple
 import numpy as np
 import scipy.special
+import math
 
-
-def compute_plddt(logits: np.ndarray) -> np.ndarray:
+def compute_plddt(logits: np.ndarray, num_res: int, recompile_padding: float = 1.0) -> np.ndarray:
   """Computes per-residue pLDDT from logits.
 
   Args:
@@ -28,6 +28,7 @@ def compute_plddt(logits: np.ndarray) -> np.ndarray:
   Returns:
     plddt: [num_res] per-residue pLDDT.
   """
+  logits = logits[:num_res]
   num_bins = logits.shape[-1]
   bin_width = 1.0 / num_bins
   bin_centers = np.arange(start=0.5 * bin_width, stop=1.0, step=bin_width)
@@ -111,9 +112,11 @@ def compute_predicted_aligned_error(
 def predicted_tm_score(
     logits: np.ndarray,
     breaks: np.ndarray,
+    num_res: int,
     residue_weights: Optional[np.ndarray] = None,
     asym_id: Optional[np.ndarray] = None,
-    interface: bool = False) -> np.ndarray:
+    interface: bool = False,
+    recompile_padding: float = 1.0) -> np.ndarray:
   """Computes predicted TM alignment or predicted interface TM alignment score.
 
   Args:
@@ -137,7 +140,7 @@ def predicted_tm_score(
 
   bin_centers = _calculate_bin_centers(breaks)
 
-  num_res = int(np.sum(residue_weights))
+  residue_weights = residue_weights[:num_res]
   # Clip num_res to avoid negative/undefined d0.
   clipped_num_res = max(num_res, 19)
 
@@ -147,7 +150,7 @@ def predicted_tm_score(
   d0 = 1.24 * (clipped_num_res - 15) ** (1./3) - 1.8
 
   # Convert logits to probs.
-  probs = scipy.special.softmax(logits, axis=-1)
+  probs = scipy.special.softmax(logits, axis=-1)[:num_res, :num_res]
 
   # TM-Score term for every bin.
   tm_per_bin = 1. / (1 + np.square(bin_centers) / np.square(d0))
@@ -156,7 +159,7 @@ def predicted_tm_score(
 
   pair_mask = np.ones(shape=(num_res, num_res), dtype=bool)
   if interface:
-    pair_mask *= asym_id[:, None] != asym_id[None, :]
+    pair_mask *= asym_id[:num_res, None] != asym_id[None, :num_res]
 
   predicted_tm_term *= pair_mask
 

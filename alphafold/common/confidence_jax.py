@@ -119,7 +119,8 @@ def predicted_tm_score_jax(
 
 def get_confidence_metrics(
     prediction_result,
-    multimer_mode: bool):
+    multimer_mode: bool,
+    recompile_padding: float = 1.0):
     """Post processes prediction_result to get confidence metrics."""
     confidence_metrics = {}
     confidence_metrics['plddt'] = compute_plddt_jax(
@@ -131,14 +132,16 @@ def get_confidence_metrics(
         confidence_metrics['ptm'] = predicted_tm_score_jax(
             logits=prediction_result['predicted_aligned_error']['logits'],
             breaks=prediction_result['predicted_aligned_error']['breaks'],
-            asym_id=None)
+            asym_id=None,
+            recompile_padding=recompile_padding)
         if multimer_mode:
             # Compute the ipTM only for the multimer model.
             confidence_metrics['iptm'] = predicted_tm_score_jax(
                 logits=prediction_result['predicted_aligned_error']['logits'],
                 breaks=prediction_result['predicted_aligned_error']['breaks'],
                 asym_id=prediction_result['predicted_aligned_error']['asym_id'],
-                interface=True)
+                interface=True,
+                recompile_padding=recompile_padding)
             confidence_metrics['ranking_confidence'] = (
                 0.8 * confidence_metrics['iptm'] + 0.2 * confidence_metrics['ptm'])
 

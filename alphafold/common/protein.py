@@ -186,7 +186,7 @@ def to_pdb(prot: Protein) -> str:
   # Add all atom sites.
   for i in range(aatype.shape[0]):
     # Close the previous chain if in a multichain PDB.
-    if last_chain_index != chain_index[i]:
+    if last_chain_index != chain_index[i] and last_chain_index < chain_index[i]:
       pdb_lines.append(_chain_end(
           atom_index, res_1to3(aatype[i - 1]), chain_ids[chain_index[i - 1]],
           residue_index[i - 1]))
