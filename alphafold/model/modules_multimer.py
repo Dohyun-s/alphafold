@@ -685,7 +685,7 @@ class EmbeddingsAndEvoformer(hk.Module):
 
       pair_activations = extra_evoformer_output['pair']
       if target_feat.shape[0] > seq_len:
-        pair_activations = jnp.pad(pair_activations,((0,rest),(0,rest),(0,0)))
+        pair_activations = jnp.pad(pair_activations, ((0,rest),(0,rest),(0,0)))
 
       # Get the size of the MSA before potentially adding templates, so we
       # can crop out the templates later.
@@ -695,8 +695,8 @@ class EmbeddingsAndEvoformer(hk.Module):
           'pair': pair_activations[:seq_len,:seq_len],
       }
       evoformer_masks = {
-        'msa': batch['msa_mask'].astype(dtype)[:,:seq_len],
-        'pair': mask_2d[:seq_len,:seq_len]
+          'msa': batch['msa_mask'].astype(dtype)[:,:seq_len],
+          'pair': mask_2d[:seq_len,:seq_len]
       }
 
       if c.template.enabled:
@@ -728,11 +728,7 @@ class EmbeddingsAndEvoformer(hk.Module):
       safe_key, safe_subkey = safe_key.split()
       evoformer_stack = layer_stack.layer_stack(c.evoformer_num_block)(
           evoformer_fn)
-      ##### if two lines below are deleted, type dismatch with jnp.float32 and bfloat16 #####
-      ##### initially evoformer_input['msa'],['pair'] are bfloat16 but when run on scan function in layer_stack, #####
-      ##### after 1 iteration, it becomes float32 which errors type dismatch #####
-      evoformer_input['msa'] = evoformer_input['msa'].astype(jnp.float32)
-      evoformer_input['pair'] = evoformer_input['pair'].astype(jnp.float32)
+
       def run_evoformer(evoformer_input):
         evoformer_output, _ = evoformer_stack((evoformer_input, safe_subkey))
         return evoformer_output
@@ -743,8 +739,8 @@ class EmbeddingsAndEvoformer(hk.Module):
       pair_activations = evoformer_output['pair']
 
       if target_feat.shape[0] > seq_len:
-        pair_activations = jnp.pad(pair_activations,((0,rest),(0,rest),(0,0)))
-        msa_activations = jnp.pad(msa_activations,((0,0),(0,rest),(0,0)))
+        pair_activations = jnp.pad(pair_activations, ((0,rest),(0,rest),(0,0)))
+        msa_activations = jnp.pad(msa_activations, ((0,0),(0,rest),(0,0)))
       single_activations = common_modules.Linear(
           c.seq_channel, name='single_activations')(
               msa_activations[0])
@@ -889,8 +885,8 @@ class SingleTemplateEmbedding(hk.Module):
     num_channels = self.config.num_channels
 
     seq = query_embedding.shape[0]
-    seq_len = math.floor(seq/gc.recompile_padding)
-    rest = seq-seq_len
+    seq_len = math.floor(seq / gc.recompile_padding)
+    rest = seq - seq_len
     def construct_input(query_embedding, template_aatype,
                         template_all_atom_positions, template_all_atom_mask,
                         multichain_mask_2d):
