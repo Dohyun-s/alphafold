@@ -17,7 +17,7 @@
 The structure generation code is in 'folding.py'.
 """
 import functools
-from alphafold.common import residue_constants, confidence_jax
+from alphafold.common import residue_constants, confidence
 from alphafold.model import all_atom
 from alphafold.model import common_modules
 from alphafold.model import folding
@@ -31,12 +31,10 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 
-
 def softmax_cross_entropy(logits, labels):
   """Computes softmax cross entropy given logits and one-hot class labels."""
   loss = -jnp.sum(labels * jax.nn.log_softmax(logits), axis=-1)
   return jnp.asarray(loss)
-
 
 def sigmoid_cross_entropy(logits, labels):
   """Computes sigmoid cross entropy given logits and multiple class labels."""
@@ -45,7 +43,6 @@ def sigmoid_cross_entropy(logits, labels):
   log_not_p = jax.nn.log_sigmoid(-logits)
   loss = -labels * log_p - (1. - labels) * log_not_p
   return jnp.asarray(loss)
-
 
 def apply_dropout(*, tensor, safe_key, rate, is_training, broadcast_dim=None):
   """Applies dropout to a tensor."""
@@ -58,7 +55,6 @@ def apply_dropout(*, tensor, safe_key, rate, is_training, broadcast_dim=None):
     return keep * tensor / keep_rate
   else:
     return tensor
-
 
 def dropout_wrapper(module,
                     input_act,
@@ -94,9 +90,7 @@ def dropout_wrapper(module,
                            broadcast_dim=broadcast_dim)
 
   new_act = output_act + residual
-
   return new_act
-
 
 def create_extra_msa_feature(batch):
   """Expand extra_msa into 1hot and concat with other extra msa features.
@@ -122,6 +116,105 @@ def create_extra_msa_feature(batch):
               jnp.expand_dims(batch['extra_deletion_value'], axis=-1)]
   return jnp.concatenate(msa_feat, axis=-1)
 
+class AlphaFoldIteration_noE(hk.Module):
+  """A single recycling iteration of AlphaFold architecture."""
+  def __init__(self, config, global_config, name='alphafold_iteration'):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+
+  def __call__(self, batch, is_training, **kwargs):
+
+    # Compute representations for each batch element and average.
+    evoformer_module = EmbeddingsAndEvoformer(self.config.embeddings_and_evoformer, self.global_config)
+    representations = evoformer_module(batch, is_training)    
+    
+    head_factory = {
+          'masked_msa': MaskedMsaHead,
+          'distogram': DistogramHead,
+          'structure_module': functools.partial(folding.StructureModule, compute_loss=False),
+          'predicted_lddt': PredictedLDDTHead,
+          'predicted_aligned_error': PredictedAlignedErrorHead,
+          'experimentally_resolved': ExperimentallyResolvedHead
+    } 
+
+    heads = {}
+    for name, head_config in sorted(self.config.heads.items()):
+      if not head_config.weight: continue
+      heads[name] = head_factory[name](head_config, self.global_config)
+    
+    ret = {'representations':representations}
+    for name, head in heads.items():
+      if name in ('predicted_lddt', 'predicted_aligned_error'):
+        continue
+      else:
+        ret[name] = head(representations, batch, is_training)
+        if 'representations' in ret[name]:
+          representations.update(ret[name].pop('representations'))
+
+    for name in ('predicted_lddt', 'predicted_aligned_error'):
+      if name in heads:
+        ret[name] = heads[name](representations, batch, is_training)
+        if name == 'predicted_aligned_error' and "asym_id" in batch:
+          ret[name]['asym_id'] = batch['asym_id']
+
+    return ret
+
+class AlphaFold_noE(hk.Module):
+  """AlphaFold model"""
+  def __init__(self, config, name='alphafold'):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = config.global_config
+
+  def __call__(self, batch, is_training, return_representations=False, **kwargs):
+    """Run the AlphaFold model"""
+    impl = AlphaFoldIteration_noE(self.config, self.global_config)
+
+    def get_prev(ret):
+      new_prev = {
+          'prev_msa_first_row': ret['representations']['msa_first_row'],
+          'prev_pair':          ret['representations']['pair'],
+          'prev_pos':           ret['structure_module']['final_atom_positions']
+      }
+      return new_prev    
+
+    prev = batch.pop("prev",None)
+    if batch["aatype"].ndim == 2:
+      batch = jax.tree_map(lambda x:x[0], batch)
+
+    # initialize
+    if prev is None:
+
+      L = batch["aatype"].shape[0]
+      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
+              'prev_pair':          jnp.zeros([L,L,128]),
+              'prev_pos':           jnp.zeros([L,37,3])}
+    else:
+      for k,v in prev.items():
+        if v.dtype == jnp.float16:
+          prev[k] = v.astype(jnp.float32)
+
+    
+    ret = impl(batch={**batch, **prev}, is_training=is_training)
+    ret["prev"] = get_prev(ret)
+    if not return_representations:
+      del ret["representations"]
+
+    # add confidence metrics
+    ret.update(confidence.get_confidence_metrics(
+      prediction_result=ret,
+      mask=batch["seq_mask"],
+      rank_by=self.config.rank_by,
+      use_jnp=True))
+      
+    ret["tol"] = confidence.compute_tol(
+      prev["prev_pos"], 
+      ret["prev"]["prev_pos"],
+      batch["seq_mask"], 
+      use_jnp=True)
+
+    return ret
 
 class AlphaFoldIteration(hk.Module):
   """A single recycling iteration of AlphaFold architecture.
@@ -262,6 +355,8 @@ class AlphaFoldIteration(hk.Module):
       # Feed all previous results to give access to structure_module result.
       head_config, module = heads[name]
       ret[name] = module(representations, batch, is_training)
+      if "asym_id" in batch:
+        ret[name]['asym_id'] = batch['asym_id']
       if compute_loss:
         total_loss += loss(module, head_config, ret, name, filter_ret=False)
 
@@ -269,7 +364,6 @@ class AlphaFoldIteration(hk.Module):
       return ret, total_loss
     else:
       return ret
-
 
 class AlphaFold(hk.Module):
   """AlphaFold model with recycling.
@@ -344,8 +438,21 @@ class AlphaFold(hk.Module):
           compute_loss=compute_loss,
           ensemble_representations=ensemble_representations)
 
-    emb_config = self.config.embeddings_and_evoformer    
-    ret = do_call(prev=batch.pop("prev"), recycle_idx=0)
+    emb_config = self.config.embeddings_and_evoformer
+    # initialize
+    prev = batch.pop("prev", None)    
+    if prev is None:
+      L = num_residues
+      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
+              'prev_pair':          jnp.zeros([L,L,128]),
+              'prev_pos':           jnp.zeros([L,37,3])}
+    else:
+      for k,v in prev.items():
+        if v.dtype == jnp.float16:
+          prev[k] = v.astype(jnp.float32)
+
+
+    ret = do_call(prev=prev, recycle_idx=0)
     ret["prev"] = get_prev(ret)
     
     if compute_loss:
@@ -353,9 +460,21 @@ class AlphaFold(hk.Module):
       
     if not return_representations:
       del (ret[0] if compute_loss else ret)['representations']  # pytype: disable=unsupported-operands
-      
-    return ret, None
 
+    # add confidence metrics
+    ret.update(confidence.get_confidence_metrics(
+      prediction_result=ret,
+      mask=batch["seq_mask"][0],
+      rank_by=self.config.rank_by,
+      use_jnp=True))
+      
+    ret["tol"] = confidence.compute_tol(
+      prev["prev_pos"], 
+      ret["prev"]["prev_pos"],
+      batch["seq_mask"][0], 
+      use_jnp=True)
+
+    return ret
 
 class TemplatePairStack(hk.Module):
   """Pair stack for the templates.
@@ -1416,8 +1535,7 @@ class DistogramHead(hk.Module):
     half_logits = common_modules.Linear(
         self.config.num_bins,
         initializer=utils.final_init(self.global_config),
-        name='half_logits')(
-            representations['pair'])
+        name='half_logits')(representations['pair'])
 
     logits = half_logits + jnp.swapaxes(half_logits, -2, -3)
     breaks = jnp.linspace(self.config.first_break, self.config.last_break,
@@ -1807,13 +1925,12 @@ class EmbeddingsAndEvoformer(hk.Module):
       if c.max_relative_feature:
         # Add one-hot-encoded clipped residue distances to the pair activations.
         pos = batch['residue_index']
-        offset = pos[:, None] - pos[None, :]
-        rel_pos = jax.nn.one_hot(
-            jnp.clip(
-                offset + c.max_relative_feature,
-                a_min=0,
-                a_max=2 * c.max_relative_feature),
-            2 * c.max_relative_feature + 1).astype(dtype)
+        offset = batch.pop("offset", pos[:,None] - pos[None,:])
+        offset = jnp.clip(offset + c.max_relative_feature, a_min=0, a_max=2 * c.max_relative_feature)
+        if "asym_id" in batch:
+          o = batch['asym_id'][:,None] - batch['asym_id'][None,:]
+          offset = jnp.where(o == 0, offset, jnp.where(o > 0, 2*c.max_relative_feature, 0))
+        rel_pos = jax.nn.one_hot(offset, 2 * c.max_relative_feature + 1).astype(dtype)
         pair_activations += common_modules.Linear(
             c.pair_channel, name='pair_activiations')(rel_pos)
 

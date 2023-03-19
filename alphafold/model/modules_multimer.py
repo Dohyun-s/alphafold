@@ -23,7 +23,7 @@ Lower-level modules up to EvoformerIteration are reused from modules.py.
 import functools
 from typing import Sequence
 
-from alphafold.common import residue_constants
+from alphafold.common import residue_constants, confidence
 from alphafold.model import all_atom_multimer
 from alphafold.model import common_modules
 from alphafold.model import folding_multimer
@@ -443,22 +443,38 @@ class AlphaFold(hk.Module):
           is_training=is_training,
           safe_key=safe_key)
     
-    #########################################
-    num_iter = c.num_recycle
-    def key_body(i, k):
-      k_ = jax.random.split(k[0])
-      o = jax.lax.cond(i==num_iter, lambda _:k[0], lambda _:k_[1], None)
-      return [k_[0],o]
-    k = safe_key.get()
-    safe_key = prng.SafeKey(jax.lax.fori_loop(0,batch.pop("iter")+1, key_body, [k,k])[1])
-    ##########################################
-    
-    ret = apply_network(prev=batch.pop("prev"), safe_key=safe_key)
+    # initialize
+    prev = batch.pop("prev", None)    
+    if prev is None:
+      L = num_residues
+      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
+              'prev_pair':          jnp.zeros([L,L,128]),
+              'prev_pos':           jnp.zeros([L,37,3])}
+    else:
+      for k,v in prev.items():
+        if v.dtype == jnp.float16:
+          prev[k] = v.astype(jnp.float32)
+
+    ret = apply_network(prev=prev, safe_key=safe_key)
     ret["prev"] = get_prev(ret)
     
     if not return_representations:
       del ret['representations']
-    return ret, None
+
+    # add confidence metrics
+    ret.update(confidence.get_confidence_metrics(
+      prediction_result=ret,
+      mask=batch["seq_mask"],
+      rank_by=self.config.rank_by,
+      use_jnp=True))
+
+    ret["tol"] = confidence.compute_tol(
+      prev["prev_pos"], 
+      ret["prev"]["prev_pos"],
+      batch["seq_mask"], 
+      use_jnp=True)
+
+    return ret
 
 class EmbeddingsAndEvoformer(hk.Module):
   """Embeds the input data and runs Evoformer.
@@ -494,10 +510,12 @@ class EmbeddingsAndEvoformer(hk.Module):
     c = self.config
     gc = self.global_config
     rel_feats = []
-    pos = batch['residue_index'][:seq_len]
-    asym_id = batch['asym_id'][:seq_len]
-    asym_id_same = jnp.equal(asym_id[:seq_len, None], asym_id[None, :])
-    offset = pos[:seq_len, None] - pos[None, :]
+    pos = batch['residue_index']
+    asym_id = batch['asym_id']
+    asym_id_same = jnp.equal(asym_id[:, None], asym_id[None, :])
+    offset = batch.pop("offset", pos[:,None] - pos[None,:])
+    dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
+
     clipped_offset = jnp.clip(
         offset + c.max_relative_idx, a_min=0, a_max=2 * c.max_relative_idx)
     dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32

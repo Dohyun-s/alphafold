@@ -92,14 +92,14 @@ def mask_mean(mask, value, axis=None, drop_mask_channel=False, eps=1e-10):
           (jnp.sum(mask, axis=axis) * broadcast_factor + eps))
 
 
-def flat_params_to_haiku(params, fuse=True):
+def flat_params_to_haiku(params, fuse=True, to_jnp=True):
   """Convert a dictionary of NumPy arrays to Haiku parameters."""
   P = {}
   for path, array in params.items():
     scope, name = path.split('//')
     if scope not in P:
       P[scope] = {}
-    P[scope][name] = jnp.array(array)
+    P[scope][name] = jnp.array(array) if to_jnp else array
   for a in ["evoformer_iteration",
             "extra_msa_stack",
             "template_embedding/single_template_embedding/template_embedding_iteration",
@@ -113,7 +113,7 @@ def flat_params_to_haiku(params, fuse=True):
           R = P.pop(f"{k}/right_{c}")
           P[f"{k}/{c}"] = {}
           for d in ["bias","weights"]:
-            P[f"{k}/{c}"][d] = jnp.concatenate([L[d],R[d]],-1)
+            P[f"{k}/{c}"][d] = jnp.concatenate([L[d],R[d]],-1) if to_jnp else np.concatenate([L[d],R[d]],-1)
         P[f"{k}/center_norm"] = P.pop(f"{k}/center_layer_norm")
         P[f"{k}/left_norm_input"] = P.pop(f"{k}/layer_norm_input")
       
