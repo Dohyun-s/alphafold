@@ -243,7 +243,7 @@ def create_extra_msa_feature(batch, num_extra_msa):
                          axis=-1), extra_msa_mask
 
 
-def sample_msa(key, batch, max_seq):
+def sample_msa(key, batch, max_seq, num_unpadded_seqs):
   """Sample MSA randomly, remaining sequences are stored as `extra_*`.
 
   Args:
@@ -254,20 +254,27 @@ def sample_msa(key, batch, max_seq):
     Protein with sampled msa.
   """
   # Sample uniformly among sequences with at least one non-masked position.
-  logits = (jnp.clip(jnp.sum(batch['msa_mask'], axis=-1), 0., 1.) - 1.) * 1e6
-  # The cluster_bias_mask can be used to preserve the first row (target
-  # sequence) for each chain, for example.
   if 'cluster_bias_mask' not in batch:
     cluster_bias_mask = jnp.pad(
         jnp.zeros(batch['msa'].shape[0] - 1), (1, 0), constant_values=1.)
   else:
     cluster_bias_mask = batch['cluster_bias_mask']
-
-  logits += cluster_bias_mask * 1e6
+  padded_len = batch['msa_mask'].shape[0]
+  if num_unpadded_seqs != 0:
+    unpadded_len = num_unpadded_seqs
+  else:
+    unpadded_len = padded_len
+  
+  logits = (jnp.clip(jnp.sum(batch['msa_mask'][:unpadded_len], axis=-1), 0., 1.) - 1.) * 1e6
+  # The cluster_bias_mask can be used to preserve the first row (target
+  # sequence) for each chain, for example.
+  logits += cluster_bias_mask[:unpadded_len] * 1e6
   index_order = gumbel_argsort_sample_idx(key.get(), logits)
   sel_idx = index_order[:max_seq]
-  extra_idx = index_order[max_seq:]
-
+  if padded_len - unpadded_len > 0:
+    extra_idx = jnp.append(index_order[max_seq:], jnp.arange(unpadded_len, padded_len))
+  else: 
+    extra_idx = index_order[max_seq:]
   for k in ['msa', 'deletion_matrix', 'msa_mask', 'bert_mask']:
     if k in batch:
       batch['extra_' + k] = batch[k][extra_idx]
@@ -583,7 +590,7 @@ class EmbeddingsAndEvoformer(hk.Module):
               target_feat)
 
       safe_key, sample_key, mask_key = safe_key.split(3)
-      batch = sample_msa(sample_key, batch, c.num_msa)
+      batch = sample_msa(sample_key, batch, c.num_msa, c.num_unpadded_seqs)
       batch = make_masked_msa(batch, mask_key, c.masked_msa)
 
       if c.use_cluster_profile:
@@ -672,6 +679,10 @@ class EmbeddingsAndEvoformer(hk.Module):
       }
       extra_masks = {'msa': extra_msa_mask, 'pair': mask_2d}
 
+      if c.num_unpadded_seqs != 0:
+        extra_evoformer_input['msa'] = extra_evoformer_input['msa'][:c.extra_msa_seqs]
+        #extra_evoformer_input['msa'] = jax.lax.dynamic_slice(extra_evoformer_input['msa'], (0,0,0,), (c.extra_msa_seqs, len(batch['aatype']), 64))
+        extra_masks['msa'] = extra_masks['msa'][:c.extra_msa_seqs]
       extra_evoformer_iteration = modules.EvoformerIteration(
           c.evoformer, gc, is_extra_msa=True, name='extra_msa_stack')
 
