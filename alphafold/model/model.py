@@ -148,30 +148,42 @@ class RunModel:
       L = aatype.shape[1]
     
     # initialize
-
-    zeros = lambda shape: np.zeros(shape, dtype=np.float16)
-    prev = {'prev_msa_first_row': zeros([L,256]),
-            'prev_pair':          zeros([L,L,128]),
-            'prev_pos':           zeros([L,37,3])}
-    
+    def z(shape, dtype=np.float32): return np.zeros(shape, dtype=dtype)
+    dtype = jnp.bfloat16 if self.config.model.global_config.bfloat16 else np.float32
+    prev = {'prev_msa_first_row': z([L,256], dtype),
+            'prev_pair':          z([L,L,128], dtype),
+            'prev_pos':           z([L,37,3])}
+    from jax2torch import jax2torch
+    import torch
     def run(key, feat, prev):
-      def _jnp_to_np(x):
-        for k, v in x.items():
-          if isinstance(v, dict):
-            x[k] = _jnp_to_np(v)
-          else:
-            x[k] = np.asarray(v,np.float16)
-        return x
-      result = _jnp_to_np(self.apply(self.params, key, {**feat, "prev":prev}))
-      prev = result.pop("prev")
-      return result, prev
-
-
+      ###indented and work###
+      def af_jax(params, key, feat, prev):
+        
+        return self.apply(params, key, {**feat, "prev":prev})
+      af_torch = jax2torch(jax.jit(af_jax))
+      params_torch = jax.tree_map(lambda x:torch.from_numpy(np.array(x)).cuda(), self.params)
+      outputs = jax.tree_map(lambda x:x,
+                            af_torch(params_torch, key, feat, prev))
+      # outputs = jax.tree_map(lambda x:np.asarray(x),
+      #                       self.apply(self.params, key, {**feat, "prev":prev}))
+      prev = outputs.pop("prev")
+      return outputs, prev
+    if self.multimer_mode:
+      sub_feat = feat
+    else:
+      s = 0
+      e = num_ensemble
+      sub_feat = jax.tree_map(lambda x:x[s:e], feat)
+    # inputs_torch = jax.tree_map(lambda x:torch.from_numpy(x).cuda(), sub_feat)
+    # prev_torch = jax.tree_map(lambda x:torch.from_numpy(x.astype(np.float32)).cuda(), prev)
+    # result, prev = run(jax.random.PRNGKey(0), inputs_torch, prev_torch)
     # initialize random key
     key = jax.random.PRNGKey(random_seed)
     
     # iterate through recyckes
-    for r in range(num_iters):      
+    stop = False
+    for r in range(num_iters):
+      
         # grab subset of features
         if self.multimer_mode:
           sub_feat = feat
@@ -182,21 +194,40 @@ class RunModel:
             
         # run
         key, sub_key = jax.random.split(key)
-        result, prev = run(sub_key, sub_feat, prev)
-        
+        feat_torch = jax.tree_map(lambda x:torch.from_numpy(x).cuda(), sub_feat)
+        # prev_torch = jax.tree_map(lambda x:torch.from_numpy(x.astype(np.float32)).cuda(), prev)
+        # result, prev = run(sub_key, sub_feat, prev)
+        result, prev = run(sub_key, feat_torch, prev)
+        ###indented and work###
+        result_ = jax.tree_map(lambda x:jnp.array(x.cpu()), result)
+        del result
+        result = result_
         if return_representations:
+          result["representations"] = {"pair":   prev["prev_pair"].astype(np.float32),
+                                       "single": prev["prev_msa_first_row"].astype(np.float32)}
+        # decide when to stop
+        tol = self.config.model.recycle_early_stop_tolerance
+        sco = self.config.model.stop_at_score
 
-          result["representations"] = {"pair":   prev["prev_pair"],
-                                       "single": prev["prev_msa_first_row"]}
-                                       
+        if result["ranking_confidence"] > sco:
+          stop = True
+        if not stop and tol > 0:
+          ca_idx = residue_constants.atom_order['CA']
+          pos = result["structure_module"]["final_atom_positions"][:,ca_idx]
+          dist = np.sqrt(np.square(pos[:,None]-pos[None,:]).sum(-1))
+          if r > 0:
+            sq_diff = np.square(dist - prev_dist)
+            seq_mask = feat["seq_mask"] if self.multimer_mode else feat["seq_mask"][0]
+            mask_2d = seq_mask[:,None] * seq_mask[None,:]
+            result["diff"] = np.sqrt((sq_diff * mask_2d).sum()/mask_2d.sum())
+            if result["diff"] < tol:
+              stop = True
+          prev_dist = dist
+
         # callback
         if callback is not None: callback(result, r)
 
-        # decide when to stop
-        if result["ranking_confidence"] > self.config.model.stop_at_score:
-          break
-        if r > 0 and result["tol"] < self.config.model.recycle_early_stop_tolerance:
-          break
+        if stop: break
 
     logging.info('Output shape was %s', tree.map_structure(lambda x: x.shape, result))
     return result, r

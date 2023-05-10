@@ -187,14 +187,10 @@ class AlphaFold_noE(hk.Module):
     if prev is None:
 
       L = batch["aatype"].shape[0]
-      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
-              'prev_pair':          jnp.zeros([L,L,128]),
+      dtype = jnp.bfloat16 if self.global_config.bfloat16 else jnp.float32
+      prev = {'prev_msa_first_row': jnp.zeros([L,256],  dtype=dtype),
+              'prev_pair':          jnp.zeros([L,L,128],dtype=dtype),
               'prev_pos':           jnp.zeros([L,37,3])}
-    else:
-      for k,v in prev.items():
-        if v.dtype == jnp.float16:
-          prev[k] = v.astype(jnp.float32)
-
     
     ret = impl(batch={**batch, **prev}, is_training=is_training)
     ret["prev"] = get_prev(ret)
@@ -208,12 +204,6 @@ class AlphaFold_noE(hk.Module):
       rank_by=self.config.rank_by,
       use_jnp=True))
       
-    ret["tol"] = confidence.compute_tol(
-      prev["prev_pos"], 
-      ret["prev"]["prev_pos"],
-      batch["seq_mask"], 
-      use_jnp=True)
-
     return ret
 
 class AlphaFoldIteration(hk.Module):
@@ -439,18 +429,13 @@ class AlphaFold(hk.Module):
           ensemble_representations=ensemble_representations)
 
     emb_config = self.config.embeddings_and_evoformer
-    # initialize
-    prev = batch.pop("prev", None)    
+    prev = batch.pop("prev", None)
     if prev is None:
       L = num_residues
-      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
-              'prev_pair':          jnp.zeros([L,L,128]),
+      dtype = jnp.bfloat16 if self.global_config.bfloat16 else jnp.float32
+      prev = {'prev_msa_first_row': jnp.zeros([L,256],  dtype=dtype),
+              'prev_pair':          jnp.zeros([L,L,128],dtype=dtype),
               'prev_pos':           jnp.zeros([L,37,3])}
-    else:
-      for k,v in prev.items():
-        if v.dtype == jnp.float16:
-          prev[k] = v.astype(jnp.float32)
-
 
     ret = do_call(prev=prev, recycle_idx=0)
     ret["prev"] = get_prev(ret)
@@ -464,15 +449,9 @@ class AlphaFold(hk.Module):
     # add confidence metrics
     ret.update(confidence.get_confidence_metrics(
       prediction_result=ret,
-      mask=batch["seq_mask"][0],
+      mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
-      use_jnp=True))
-      
-    ret["tol"] = confidence.compute_tol(
-      prev["prev_pos"], 
-      ret["prev"]["prev_pos"],
-      batch["seq_mask"][0], 
-      use_jnp=True)
+      use_jnp=True))      
 
     return ret
 
@@ -1925,7 +1904,7 @@ class EmbeddingsAndEvoformer(hk.Module):
       if c.max_relative_feature:
         # Add one-hot-encoded clipped residue distances to the pair activations.
         pos = batch['residue_index']
-        offset = batch.pop("offset", pos[:,None] - pos[None,:])
+        offset = pos[:,None] - pos[None,:]
         offset = jnp.clip(offset + c.max_relative_feature, a_min=0, a_max=2 * c.max_relative_feature)
         if "asym_id" in batch:
           o = batch['asym_id'][:,None] - batch['asym_id'][None,:]
